@@ -1,17 +1,27 @@
 import React, { useRef, useEffect, useState } from "react";
 import { io } from "socket.io-client";
 
-const socket = io(process.env.REACT_APP_BACKEND_URL || "http://localhost:4000", {
-  transports: ["websocket"]
+// Resolve backend URL
+const BACKEND_URL = (typeof window !== "undefined" && window.PUMP_BACKEND_URL)
+  || process.env.REACT_APP_BACKEND_URL
+  || "";
+
+const socket = io(BACKEND_URL, {
+  transports: ["websocket"],
+  withCredentials: false,
+  reconnection: true,
+  reconnectionAttempts: Infinity
 });
 
-// Utility: screen -> world and world -> screen
-function getInverseTransform(scale, offsetX, offsetY) {
-  return (sx, sy, canvas) => {
+function getInverseTransform(scale, offsetX, offsetY, canvas, dpr) {
+  return (sx, sy) => {
     const rect = canvas.getBoundingClientRect();
-    const x = (sx - rect.left - canvas.width / 2) / scale - offsetX;
-    const y = (sy - rect.top - canvas.height / 2) / scale - offsetY;
-    return { x, y };
+    // screen -> CSS pixels -> world (account for DPR)
+    const cssX = (sx - rect.left);
+    const cssY = (sy - rect.top);
+    const worldX = (cssX - canvas.clientWidth / 2) / scale - offsetX;
+    const worldY = (cssY - canvas.clientHeight / 2) / scale - offsetY;
+    return { x: worldX, y: worldY };
   };
 }
 
@@ -19,7 +29,7 @@ export default function App() {
   const canvasRef = useRef(null);
   const [ctx, setCtx] = useState(null);
 
-  // View transform
+  // View
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
 
@@ -27,37 +37,112 @@ export default function App() {
   const [color, setColor] = useState("#111111");
   const [size, setSize] = useState(3);
 
+  // Connection
+  const [connected, setConnected] = useState(false);
+  const [connMsg, setConnMsg] = useState("connecting…");
+
   // Interaction state
-  const [isDrawing, setIsDrawing] = useState(false);
-  const [isPanning, setIsPanning] = useState(false);
+  const drawingRef = useRef(false);
+  const panningRef = useRef(false);
   const lastPos = useRef({ x: 0, y: 0 });
   const panStart = useRef({ x: 0, y: 0 });
   const offsetStart = useRef({ x: 0, y: 0 });
 
-  // Ball size (world units)
-  const BALL_RADIUS = 2000; // world units, large canvas
-  const WORLD_SIZE = BALL_RADIUS * 2 + 200; // padding
+  // DPR
+  const dprRef = useRef(1);
 
-  // Keep a local list of strokes to redraw on transform changes
+  // Ball/world
+  const BALL_RADIUS = 2000;
+  const WORLD_SIZE = BALL_RADIUS * 2 + 200;
   const strokesRef = useRef([]);
 
-  // Initialize canvas
+  // Init canvas with DPR scaling
   useEffect(() => {
     const canvas = canvasRef.current;
     const context = canvas.getContext("2d");
     setCtx(context);
 
     const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      dprRef.current = dpr;
+      // Set display size (CSS pixels)
+      const cssW = window.innerWidth;
+      const cssH = window.innerHeight;
+      // Set actual canvas size in device pixels
+      canvas.width = Math.floor(cssW * dpr);
+      canvas.height = Math.floor(cssH * dpr);
+      canvas.style.width = cssW + "px";
+      canvas.style.height = cssH + "px";
+      context.setTransform(dpr, 0, 0, dpr, 0, 0); // scale all drawing ops by DPR
       render(context);
     };
     window.addEventListener("resize", resize);
     resize();
 
-    // Receive history and live strokes
+    // Native wheel listener with passive:false so preventDefault works everywhere
+    const onWheel = (e) => {
+      e.preventDefault();
+      const delta = -e.deltaY;
+      const zoomIntensity = 0.0015;
+      const newScale = Math.min(5, Math.max(0.2, scale * (1 + delta * zoomIntensity)));
+      const inv = getInverseTransform(scale, offset.x, offset.y, canvas, dprRef.current);
+      const before = inv(e.clientX, e.clientY);
+      const invNew = getInverseTransform(newScale, offset.x, offset.y, canvas, dprRef.current);
+      const after = invNew(e.clientX, e.clientY);
+      const dx = after.x - before.x;
+      const dy = after.y - before.y;
+      setOffset((o) => ({ x: o.x + dx, y: o.y + dy }));
+      setScale(newScale);
+    };
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+
+    // Pointer events (mouse/touch unified)
+    const onPointerDown = (e) => {
+      canvas.setPointerCapture?.(e.pointerId);
+      if (e.button === 1 || e.button === 2 || e.shiftKey || e.altKey || e.metaKey || e.ctrlKey) {
+        panningRef.current = true;
+        panStart.current = { x: e.clientX, y: e.clientY };
+        offsetStart.current = { ...offset };
+        return;
+      }
+      drawingRef.current = true;
+      const inv = getInverseTransform(scale, offset.x, offset.y, canvas, dprRef.current);
+      lastPos.current = inv(e.clientX, e.clientY);
+    };
+
+    const onPointerMove = (e) => {
+      if (panningRef.current) {
+        const dx = (e.clientX - panStart.current.x) / scale;
+        const dy = (e.clientY - panStart.current.y) / scale;
+        setOffset({ x: offsetStart.current.x + dx, y: offsetStart.current.y + dy });
+        return;
+      }
+      if (!drawingRef.current || !connected) return;
+      const inv = getInverseTransform(scale, offset.x, offset.y, canvas, dprRef.current);
+      const p = inv(e.clientX, e.clientY);
+      const stroke = { x0: lastPos.current.x, y0: lastPos.current.y, x1: p.x, y1: p.y, color, size };
+      strokesRef.current.push(stroke);
+      drawStroke(context, stroke);
+      socket.emit("draw", stroke);
+      lastPos.current = p;
+    };
+
+    const endAll = () => { drawingRef.current = false; panningRef.current = false; };
+
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerup", endAll);
+    canvas.addEventListener("pointerleave", endAll);
+    canvas.addEventListener("pointercancel", endAll);
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+    // Socket events
+    socket.on("connect", () => { setConnected(true); setConnMsg("connected"); });
+    socket.on("disconnect", () => { setConnected(false); setConnMsg("disconnected"); });
+    socket.on("connect_error", (err) => { setConnected(false); setConnMsg("connect error"); console.error("socket connect_error", err); });
+
     socket.on("init", (history) => {
-      strokesRef.current = history;
+      strokesRef.current = history || [];
       render(context);
     });
     socket.on("draw", (stroke) => {
@@ -68,25 +153,24 @@ export default function App() {
 
     return () => {
       window.removeEventListener("resize", resize);
-      socket.off("init");
-      socket.off("draw");
+      canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup", endAll);
+      canvas.removeEventListener("pointerleave", endAll);
+      canvas.removeEventListener("pointercancel", endAll);
+      socket.off("connect"); socket.off("disconnect"); socket.off("connect_error");
+      socket.off("init"); socket.off("draw");
     };
-  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scale, offset, color, size, connected]);
 
-  // Redraw when transform changes
-  useEffect(() => {
-    if (ctx) render(ctx);
-  }, [scale, offset]);
-
-  function clearCanvas(context) {
-    const c = context.canvas;
-    context.clearRect(0, 0, c.width, c.height);
-  }
-
+  // Rendering helpers
   function applyView(context) {
     const c = context.canvas;
     context.save();
-    context.translate(c.width / 2, c.height / 2);
+    // We already set DPR with setTransform; now apply view in CSS px space
+    context.translate(c.clientWidth / 2, c.clientHeight / 2);
     context.scale(scale, scale);
     context.translate(offset.x, offset.y);
   }
@@ -129,10 +213,10 @@ export default function App() {
   }
 
   function drawBackground(context) {
-    // subtle bg
     const c = context.canvas;
     context.save();
-    context.fillStyle = "#fafafa";
+    context.clearRect(0, 0, c.width, c.height);
+    context.fillStyle = "#0b0b10";
     context.fillRect(0, 0, c.width, c.height);
     context.restore();
   }
@@ -157,13 +241,12 @@ export default function App() {
 
   function render(context) {
     if (!context) return;
-    clearCanvas(context);
     drawBackground(context);
 
     applyView(context);
     drawGrid(context);
 
-    // Mask and fill ball
+    // Fill ball
     context.save();
     context.beginPath();
     context.arc(0, 0, BALL_RADIUS, 0, Math.PI * 2);
@@ -171,11 +254,20 @@ export default function App() {
     context.fill();
     context.restore();
 
-    // Draw all strokes
+    // Strokes
     context.save();
     applyView(context);
     drawBallMask(context);
-    for (const s of strokesRef.current) drawStroke(context, s);
+    for (const s of strokesRef.current) {
+      context.beginPath();
+      context.moveTo(s.x0, s.y0);
+      context.lineTo(s.x1, s.y1);
+      context.strokeStyle = s.color || "#111";
+      context.lineWidth = (s.size || 3);
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      context.stroke();
+    }
     context.restore();
 
     drawBallBorder(context);
@@ -183,107 +275,16 @@ export default function App() {
   }
 
   function drawHUD(context) {
-    // Simple HUD – top-left
     context.save();
-    context.resetTransform?.();
-    // Fallback for browsers without resetTransform
-    const c = context.canvas;
-    context.clearRect(0, 0, 0, 0);
-    context.font = "14px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto";
-    context.fillStyle = "#222";
+    // HUD in CSS pixels
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.scale(dprRef.current, dprRef.current);
     const info = `scale ${scale.toFixed(2)} | offset (${offset.x.toFixed(0)}, ${offset.y.toFixed(0)}) | strokes ${strokesRef.current.length}`;
+    context.font = "14px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto";
+    context.fillStyle = "#eaeaea";
     context.fillText(info, 12, 24);
     context.restore();
   }
-
-  // Mouse / touch handlers
-  const onWheel = (e) => {
-    e.preventDefault();
-    const delta = -e.deltaY;
-    const zoomIntensity = 0.0015;
-    const newScale = Math.min(5, Math.max(0.2, scale * (1 + delta * zoomIntensity)));
-
-    // Zoom to cursor
-    const inv = getInverseTransform(scale, offset.x, offset.y);
-    const worldBefore = inv(e.clientX, e.clientY, canvasRef.current);
-    const invNew = getInverseTransform(newScale, offset.x, offset.y);
-    const worldAfter = invNew(e.clientX, e.clientY, canvasRef.current);
-    const dx = worldAfter.x - worldBefore.x;
-    const dy = worldAfter.y - worldBefore.y;
-
-    setOffset({ x: offset.x + dx, y: offset.y + dy });
-    setScale(newScale);
-  };
-
-  const onMouseDown = (e) => {
-    if (e.button === 1 || e.button === 2 || e.shiftKey || e.altKey || e.metaKey || e.ctrlKey) {
-      // Pan mode with right/middle click or modifier
-      setIsPanning(true);
-      panStart.current = { x: e.clientX, y: e.clientY };
-      offsetStart.current = { ...offset };
-      return;
-    }
-    // Draw
-    setIsDrawing(true);
-    const inv = getInverseTransform(scale, offset.x, offset.y);
-    const p = inv(e.clientX, e.clientY, canvasRef.current);
-    lastPos.current = p;
-  };
-
-  const onMouseMove = (e) => {
-    if (isPanning) {
-      const dx = (e.clientX - panStart.current.x) / scale;
-      const dy = (e.clientY - panStart.current.y) / scale;
-      setOffset({ x: offsetStart.current.x + dx, y: offsetStart.current.y + dy });
-      return;
-    }
-    if (!isDrawing) return;
-    const inv = getInverseTransform(scale, offset.x, offset.y);
-    const p = inv(e.clientX, e.clientY, canvasRef.current);
-    const stroke = { x0: lastPos.current.x, y0: lastPos.current.y, x1: p.x, y1: p.y, color, size };
-    strokesRef.current.push(stroke);
-    drawStroke(ctx, stroke);
-    socket.emit("draw", stroke);
-    lastPos.current = p;
-  };
-
-  const endStroke = () => {
-    setIsDrawing(false);
-    setIsPanning(false);
-  };
-
-  // Touch support
-  const onTouchStart = (e) => {
-    if (e.touches.length === 2) {
-      setIsPanning(true);
-      panStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-      offsetStart.current = { ...offset };
-      return;
-    }
-    setIsDrawing(true);
-    const inv = getInverseTransform(scale, offset.x, offset.y);
-    const p = inv(e.touches[0].clientX, e.touches[0].clientY, canvasRef.current);
-    lastPos.current = p;
-  };
-
-  const onTouchMove = (e) => {
-    if (isPanning) {
-      const dx = (e.touches[0].clientX - panStart.current.x) / scale;
-      const dy = (e.touches[0].clientY - panStart.current.y) / scale;
-      setOffset({ x: offsetStart.current.x + dx, y: offsetStart.current.y + dy });
-      return;
-    }
-    if (!isDrawing) return;
-    const inv = getInverseTransform(scale, offset.x, offset.y);
-    const p = inv(e.touches[0].clientX, e.touches[0].clientY, canvasRef.current);
-    const stroke = { x0: lastPos.current.x, y0: lastPos.current.y, x1: p.x, y1: p.y, color, size };
-    strokesRef.current.push(stroke);
-    drawStroke(ctx, stroke);
-    socket.emit("draw", stroke);
-    lastPos.current = p;
-  };
-
-  const onTouchEnd = () => endStroke();
 
   return (
     <div className="app">
@@ -291,39 +292,17 @@ export default function App() {
         <span className="brand">🟢 Pump Ball</span>
         <label>
           Color
-          <input
-            type="color"
-            value={color}
-            onChange={(e) => setColor(e.target.value)}
-          />
+          <input type="color" value={color} onChange={(e) => setColor(e.target.value)} />
         </label>
         <label>
           Size
-          <input
-            type="range"
-            min="1"
-            max="40"
-            value={size}
-            onChange={(e) => setSize(parseInt(e.target.value, 10))}
-          />
+          <input type="range" min="1" max="40" value={size} onChange={(e) => setSize(parseInt(e.target.value, 10))} />
           <span className="size">{size}px</span>
         </label>
-        <span className="hint">Left‑click: draw • Right‑click/Shift: pan • Wheel: zoom</span>
+        <span className="hint">Left/Middle/Right + Shift = pan • Wheel = zoom</span>
       </div>
 
-      <canvas
-        ref={canvasRef}
-        onContextMenu={(e) => e.preventDefault()}
-        onWheel={onWheel}
-        onMouseDown={onMouseDown}
-        onMouseMove={onMouseMove}
-        onMouseUp={endStroke}
-        onMouseLeave={endStroke}
-        onTouchStart={onTouchStart}
-        onTouchMove={onTouchMove}
-        onTouchEnd={onTouchEnd}
-        style={{ display: "block", width: "100vw", height: "100vh", cursor: isPanning ? "grab" : "crosshair" }}
-      />
+      <canvas ref={canvasRef} style={{ display: "block", width: "100vw", height: "100vh", touchAction: "none", cursor: panningRef.current ? "grab" : "crosshair" }} />
 
       <style>{`
         :root { --bg: #0b0b10; --panel: #11131a; --text: #eaeaea; }
@@ -335,12 +314,18 @@ export default function App() {
           background: rgba(17,19,26,0.8); backdrop-filter: blur(6px);
           padding: 10px 12px; border: 1px solid #22273a; border-radius: 12px; color: var(--text);
           font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto;
+          z-index: 10;
         }
-        .brand { font-weight: 700; letter-spacing: 0.2px; }
         label { display: inline-flex; align-items: center; gap: 8px; }
         input[type="range"] { width: 120px; }
         .hint { margin-left: auto; opacity: 0.7; font-size: 12px; }
+        .conn { position: fixed; top: 12px; right: 12px; padding: 6px 10px; border-radius: 10px; font-size: 12px;
+          background: rgba(17,19,26,0.8); border: 1px solid #22273a; color: var(--text); z-index: 11; }
+        .conn.ok { outline: 1px solid #1db95440; }
+        .conn.err { outline: 1px solid #ff4d4f40; }
       `}</style>
+
+      <div className={`conn ${connected ? "ok" : "err"}`}>ws: {connMsg}</div>
     </div>
   );
 }
