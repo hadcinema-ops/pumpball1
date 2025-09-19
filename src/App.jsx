@@ -162,7 +162,6 @@ export default function App() {
       socket.off("connect"); socket.off("disconnect"); socket.off("connect_error");
       socket.off("init"); socket.off("draw");
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scale, offset, color, size, connected]);
 
   // Rendering helpers
