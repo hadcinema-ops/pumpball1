@@ -71,13 +71,11 @@ export default function App() {
       socket.off("init");
       socket.off("draw");
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Redraw when transform changes
   useEffect(() => {
     if (ctx) render(ctx);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scale, offset]);
 
   function clearCanvas(context) {
