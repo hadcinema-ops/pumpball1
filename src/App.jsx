@@ -2,7 +2,7 @@ import React, { useRef, useEffect, useState } from "react";
 import { io } from "socket.io-client";
 
 /** --- Pump.fun Contract (hard-coded) --- */
-const CONTRACT_ADDRESS = "PASTE_YOUR_PUMPFUN_MINT";
+const CONTRACT_ADDRESS = "37gh3B2RYV3vAvnUEmVMkaskMtUZwyqogXzV22fRpump";
 const PUMPFUN_URL = `https://pump.fun/coin/${CONTRACT_ADDRESS}`;
 
 /** Backend URL resolution **/
