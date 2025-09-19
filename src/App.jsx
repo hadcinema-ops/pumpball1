@@ -6,13 +6,13 @@ const CONTRACT_ADDRESS = "37gh3B2RYV3vAvnUEmVMkaskMtUZwyqogXzV22fRpump";
 const PUMPFUN_URL = `https://pump.fun/coin/${CONTRACT_ADDRESS}`;
 
 /** Access policy */
-const REQUIRED_PCT = 0.0001; // 0.01%
-const DEMO_LIMIT = 10;       // strokes allowed for demo users
+const DEMO_LIMIT = 10; // strokes allowed for demo users
+const REQUIRED_TOKENS = 100_000; // must hold ≥100,000 tokens
 
 /** Solana RPC (PublicNode) */
 const RPC_URL = "https://solana-rpc.publicnode.com";
 
-/** Backend URL resolution (kept from your original) */
+/** Backend URL resolution (from your original) */
 const BACKEND_URL =
   (typeof window !== "undefined" && window.PUMP_BACKEND_URL) ||
   process.env.REACT_APP_BACKEND_URL ||
@@ -71,6 +71,15 @@ export default function App() {
   const incomingQueue = useRef([]);
   const needsRender = useRef(true);
 
+  /** --------- Toast (no libs) ---------- */
+  const [toast, setToast] = useState({ show: false, msg: "" });
+  const toastTimer = useRef(null);
+  function showToast(msg, ms = 1600) {
+    setToast({ show: true, msg });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast({ show: false, msg: "" }), ms);
+  }
+
   /** --------- Offscreen buffer (no-reset, infinite strokes) ---------- */
   const bufferCanvasRef = useRef(null);
   const bufferCtxRef = useRef(null);
@@ -118,7 +127,7 @@ export default function App() {
     try {
       const provider = window.solana;
       if (!provider || !provider.isPhantom) {
-        alert("Phantom wallet not found. Please install Phantom to draw.");
+        showToast("Phantom wallet not found.");
         return;
       }
       const resp = await provider.connect();
@@ -127,6 +136,7 @@ export default function App() {
       if (address) await checkHoldings(address);
     } catch (e) {
       console.error("Wallet connect error", e);
+      showToast("Wallet connect failed.");
     }
   }
 
@@ -134,47 +144,34 @@ export default function App() {
     setCheckingHoldings(true);
     setRpcNote("");
     try {
-      // 1) Total supply for the mint
-      const supplyRes = await rpc("getTokenSupply", [CONTRACT_ADDRESS]);
-      // supplyRes.value.amount is a string in raw units, value.decimals indicates decimals
-      const supplyRaw = BigInt(supplyRes.value.amount);
-      const decimals = supplyRes.value.decimals;
-      if (supplyRaw === 0n) {
-        setHasFullAccess(false);
-        setRpcNote("Total supply is zero (unexpected).");
-        return;
-      }
-
-      // 2) Holder balance for this mint
-      // Use jsonParsed to read tokenAmount easily
+      // Holder token accounts for this mint
       const accts = await rpc("getTokenAccountsByOwner", [
         address,
         { mint: CONTRACT_ADDRESS },
         { encoding: "jsonParsed" },
       ]);
 
-      let holderRaw = 0n;
-      for (const a of accts.value || []) {
+      let holderAmount = 0;
+      for (const a of (accts.value || [])) {
         const tok = a.account?.data?.parsed?.info?.tokenAmount;
-        if (tok?.amount) holderRaw += BigInt(tok.amount);
+        if (tok?.uiAmount) holderAmount += Number(tok.uiAmount);
       }
 
-      // 3) Percent
-      // percentOwned = holderRaw / supplyRaw
-      const pctOwned = Number(holderRaw) / Number(supplyRaw);
+      const pass = holderAmount >= REQUIRED_TOKENS;
+      setHasFullAccess(pass);
 
-      setHasFullAccess(pctOwned >= REQUIRED_PCT);
-      if (pctOwned < REQUIRED_PCT) {
-        setRpcNote(
-          `Hold ≥ ${(REQUIRED_PCT * 100).toFixed(2)}% to draw freely. You have ${(pctOwned * 100).toFixed(4)}%.`
-        );
+      if (pass) {
+        setRpcNote(`Verified: ${holderAmount.toLocaleString()} tokens`);
+        showToast("Access granted ✅");
       } else {
-        setRpcNote(`Verified: ${(pctOwned * 100).toFixed(4)}%`);
+        setRpcNote(`Need at least 100,000 tokens. You have ${holderAmount.toLocaleString()}.`);
+        showToast("Need ≥ 100,000 tokens for full access.");
       }
     } catch (e) {
       console.error("checkHoldings failed", e);
       setHasFullAccess(false);
-      setRpcNote("Holdings check failed (RPC/CORS/rate-limit). Using demo mode.");
+      setRpcNote("Holdings check failed. Using demo mode.");
+      showToast("Holdings check failed. Demo mode.");
     } finally {
       setCheckingHoldings(false);
     }
@@ -204,12 +201,11 @@ export default function App() {
     const ctx = canvas.getContext("2d");
     ctxRef.current = ctx;
 
-    // init buffer (permanent)
+    // init buffer
     const b = document.createElement("canvas");
     b.width = BUF_SIZE;
     b.height = BUF_SIZE;
     const bctx = b.getContext("2d");
-    // prime buffer with white ball (clipped)
     bctx.save();
     bctx.beginPath();
     bctx.arc(BUF_SIZE / 2, BUF_SIZE / 2, BALL_RADIUS, 0, Math.PI * 2);
@@ -263,7 +259,7 @@ export default function App() {
         return;
       }
       if (!canDrawNow()) {
-        alert("Hold at least 0.01% to draw freely. Demo limit reached.");
+        showToast("Need 100,000 tokens to keep drawing — demo limit reached.");
         return;
       }
       drawingRef.current = true;
@@ -289,13 +285,9 @@ export default function App() {
       if (dist(p, lastPos.current) < 1 && (now - lastEmit.current) < 12) return;
 
       const stroke = { x0: lastPos.current.x, y0: lastPos.current.y, x1: p.x, y1: p.y, color, size };
-
-      // draw to buffer immediately (permanent)
       drawStrokeToBuffer(stroke);
-
-      // bookkeeping + network
       strokesRef.current.push(stroke);
-      incomingQueue.current.push(null); // trigger thin border redraw
+      incomingQueue.current.push(null);
       socket.emit("draw", stroke);
 
       lastPos.current = p;
@@ -329,10 +321,10 @@ export default function App() {
 
     socket.on("draw", (s) => {
       if (s) {
-        drawStrokeToBuffer(s);          // permanent
+        drawStrokeToBuffer(s);
         strokesRef.current.push(s);
       }
-      incomingQueue.current.push(null); // mark a frame update
+      incomingQueue.current.push(null);
     });
 
     // animation loop
@@ -355,20 +347,17 @@ export default function App() {
     // eslint-disable-next-line
   }, [connected, color, size]);
 
-  /** Render a frame (fast: blit buffer + overlays) **/
+  /** Render a frame **/
   function paintFrame() {
     const ctx = ctxRef.current;
     const bcv = bufferCanvasRef.current;
     if (!ctx || !bcv) return;
 
     const canvas = ctx.canvas;
-
-    // clear screen
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = "#0b0b10";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // world transform
     ctx.save();
     ctx.translate(canvas.clientWidth / 2, canvas.clientHeight / 2);
     ctx.scale(scaleRef.current, scaleRef.current);
@@ -387,7 +376,7 @@ export default function App() {
     }
     ctx.restore();
 
-    // clip to ball and blit buffer
+    // blit buffer inside ball
     ctx.save();
     ctx.beginPath();
     ctx.arc(0, 0, BALL_RADIUS, 0, Math.PI * 2);
@@ -395,7 +384,7 @@ export default function App() {
     ctx.drawImage(bcv, -BUF_SIZE / 2, -BUF_SIZE / 2);
     ctx.restore();
 
-    // crisp border
+    // border
     ctx.beginPath();
     ctx.arc(0, 0, BALL_RADIUS, 0, Math.PI * 2);
     ctx.lineWidth = 4 / scaleRef.current;
@@ -404,7 +393,6 @@ export default function App() {
 
     ctx.restore();
 
-    // HUD ~10Hz
     if (!paintFrame._lastHud || performance.now() - paintFrame._lastHud > 100) {
       setHud({
         scale: scaleRef.current,
@@ -423,30 +411,21 @@ export default function App() {
       <div className="toolbar">
         <span className="brand">🟢 Pump Ball</span>
 
-        {/* Pump.fun contract badge + copy */}
         <div className="contract">
-          <a
-            className="badge"
-            href={PUMPFUN_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            title="Open on Pump.fun"
-          >
+          <a className="badge" href={PUMPFUN_URL} target="_blank" rel="noopener noreferrer">
             {CONTRACT_ADDRESS}
           </a>
           <button
             className="copy"
             onClick={() => {
               navigator.clipboard.writeText(CONTRACT_ADDRESS);
-              alert("Contract address copied!");
+              showToast("Contract copied ✅");
             }}
-            title="Copy contract address"
           >
             Copy
           </button>
         </div>
 
-        {/* Wallet gate */}
         {walletAddr ? (
           <span className="wallet" title={rpcNote || "Wallet connected"}>
             {walletAddr.slice(0, 4)}…{walletAddr.slice(-4)}{" "}
@@ -462,13 +441,7 @@ export default function App() {
         </label>
         <label>
           Size
-          <input
-            type="range"
-            min="1"
-            max="40"
-            value={size}
-            onChange={(e) => setSize(parseInt(e.target.value, 10))}
-          />
+          <input type="range" min="1" max="40" value={size} onChange={(e) => setSize(parseInt(e.target.value, 10))} />
           <span className="size">{size}px</span>
         </label>
         <span className="hint">Left/Middle/Right or Shift = pan • Wheel = zoom</span>
@@ -479,6 +452,9 @@ export default function App() {
       </div>
 
       <canvas ref={canvasRef} style={{ display: "block", width: "100vw", height: "100vh" }} />
+
+      {/* Toast UI */}
+      <div className={`toast ${toast.show ? "show" : ""}`}>{toast.msg}</div>
 
       <style>{`
         :root { --bg: #0b0b10; --panel: #11131a; --text: #eaeaea; }
@@ -492,9 +468,7 @@ export default function App() {
           font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto;
           z-index: 10;
         }
-        .contract {
-          display: inline-flex; align-items: center; gap: 8px; margin-right: 4px;
-        }
+        .contract { display: inline-flex; align-items: center; gap: 8px; margin-right: 4px; }
         .badge {
           background: linear-gradient(90deg, #6a0dad, #00ff99);
           color: white; padding: 6px 12px; border-radius: 8px;
@@ -504,23 +478,29 @@ export default function App() {
           box-shadow: 0 0 10px rgba(0,0,0,0.25);
           white-space: nowrap; max-width: 42vw; overflow: hidden; text-overflow: ellipsis;
         }
-        .copy {
-          background: #fff; color: #6a0dad; border: none;
-          padding: 6px 10px; border-radius: 6px; cursor: pointer; font-weight: 700;
-        }
-        .connect {
-          background: #00ff99; color: #11131a; border: none;
-          padding: 6px 10px; border-radius: 8px; cursor: pointer; font-weight: 800;
-        }
+        .copy { background: #fff; color: #6a0dad; border: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; font-weight: 700; }
+        .connect { background: #00ff99; color: #11131a; border: none; padding: 6px 10px; border-radius: 8px; cursor: pointer; font-weight: 800; }
         .wallet { font-size: 12px; opacity: 0.9; padding: 2px 8px; border: 1px solid #22273a; border-radius: 8px; }
         label { display: inline-flex; align-items: center; gap: 8px; }
         input[type="range"] { width: 120px; }
         .hint { opacity: 0.7; font-size: 12px; }
         .hud { opacity: 0.8; font-size: 12px; margin-left: auto; }
-        .conn { padding: 4px 8px; border-radius: 10px; font-size: 12px;
-          background: rgba(17,19,26,0.8); border: 1px solid #22273a; color: var(--text); }
+        .conn { padding: 4px 8px; border-radius: 10px; font-size: 12px; background: rgba(17,19,26,0.8); border: 1px solid #22273a; color: var(--text); }
         .conn.ok { outline: 1px solid #1db95440; }
         .conn.err { outline: 1px solid #ff4d4f40; }
+
+        /* Toast styles */
+        .toast {
+          position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%) translateY(20px);
+          background: rgba(17,19,26,0.9);
+          color: #fff; padding: 10px 14px; border-radius: 10px; border: 1px solid #22273a;
+          font-size: 14px; opacity: 0; transition: opacity .2s ease, transform .2s ease;
+          z-index: 50; pointer-events: none;
+        }
+        .toast.show {
+          opacity: 1; transform: translateX(-50%) translateY(0);
+        }
+
         @media (max-width: 640px) { .badge { max-width: 58vw; } }
       `}</style>
     </div>
